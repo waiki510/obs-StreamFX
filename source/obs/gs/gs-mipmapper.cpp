@@ -18,6 +18,7 @@
  */
 
 #include "gs-mipmapper.hpp"
+#include <algorithm>
 #include <stdexcept>
 #include "obs/gs/gs-helper.hpp"
 #include "plugin.hpp"
@@ -34,43 +35,6 @@
 #pragma warning(pop)
 #endif
 
-#if defined(WIN32) || defined(WIN64)
-extern "C" {
-#include <Windows.h>
-}
-#endif
-
-// Here be dragons!
-// This is to add support for mipmap generation which is by default not possible with libobs.
-// OBS hides a ton of possible things from us, which we'd have to simulate - or just hack around.
-struct graphics_subsystem {
-	void*        module;
-	gs_device_t* device;
-	// No other fields required.
-};
-
-#if defined(WIN32) || defined(WIN64)
-#include <d3d11.h>
-#include <dxgi.h>
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4201)
-#endif
-#include <util/windows/ComPtr.hpp>
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
-// Slaughtered copy of d3d11-subsystem.hpp gs_device. We only need up to device and context, the rest is "unknown" to us.
-struct gs_d3d11_device {
-	ComPtr<IDXGIFactory1>       factory;
-	ComPtr<IDXGIAdapter1>       adapter;
-	ComPtr<ID3D11Device>        device;
-	ComPtr<ID3D11DeviceContext> context;
-	// No other fields required.
-};
-#endif
-
 gs::mipmapper::~mipmapper()
 {
 	_vb.reset();
@@ -80,202 +44,215 @@ gs::mipmapper::~mipmapper()
 
 gs::mipmapper::mipmapper()
 {
-	_vb            = std::make_unique<gs::vertex_buffer>(uint32_t(6u), uint8_t(1u));
-	auto v0        = _vb->at(0);
-	v0.position->x = 0;
-	v0.position->y = 0;
-	v0.uv[0]->x    = 0;
-	v0.uv[0]->y    = 0;
+	auto gctx = gs::context();
+	_vb       = std::make_shared<gs::vertex_buffer>(uint32_t(3u), uint8_t(1u));
 
-	auto v1        = _vb->at(1);
-	auto v4        = _vb->at(4);
-	v4.position->x = v1.position->x = 1.0;
-	v4.position->y = v1.position->y = 0;
-	v4.uv[0]->x = v1.uv[0]->x = 1.0;
-	v4.uv[0]->y = v1.uv[0]->y = 0;
+	{
+		auto vtx        = _vb->at(0);
+		vtx.position->x = vtx.position->y = vtx.uv[0]->x = vtx.uv[0]->y = 0.0;
+	}
 
-	auto v2        = _vb->at(2);
-	auto v3        = _vb->at(3);
-	v3.position->x = v2.position->x = 0;
-	v3.position->y = v2.position->y = 1.0;
-	v3.uv[0]->x = v2.uv[0]->x = 0;
-	v3.uv[0]->y = v2.uv[0]->y = 1.0;
+	{
+		auto vtx        = _vb->at(1);
+		vtx.position->x = 1.;
+		vtx.uv[0]->x    = 2.;
+		vtx.position->y = vtx.uv[0]->y = 0.0;
+	}
 
-	auto v5        = _vb->at(5);
-	v5.position->x = 1.0;
-	v5.position->y = 1.0;
-	v5.uv[0]->x    = 1.0;
-	v5.uv[0]->y    = 1.0;
+	{
+		auto vtx        = _vb->at(2);
+		vtx.position->y = 1.;
+		vtx.uv[0]->y    = 2.;
+		vtx.position->x = vtx.uv[0]->x = 0.0;
+	}
 
 	_vb->update();
 
 	char* effect_file = obs_module_file("effects/mipgen.effect");
-	_effect           = std::make_unique<gs::effect>(effect_file);
+	_effect           = std::make_shared<gs::effect>(effect_file);
 	bfree(effect_file);
+
+#ifdef WIN32
+	if (gs_get_device_type() == GS_DEVICE_DIRECT3D_11) {
+		_d3d_device = ATL::CComPtr<ID3D11Device>(reinterpret_cast<ID3D11Device*>(gs_get_device_obj()));
+		_d3d_device->GetImmediateContext(&_d3d_context);
+	}
+#endif
+	if (gs_get_device_type() == GS_DEVICE_OPENGL) {
+		// Not Implemented Yet.
+	}
 }
 
 void gs::mipmapper::rebuild(std::shared_ptr<gs::texture> source, std::shared_ptr<gs::texture> target,
 							gs::mipmapper::generator generator = gs::mipmapper::generator::Linear,
 							float_t                  strength  = 1.0)
 {
-	// Here be dragons! You have been warned.
-
-	// Do nothing if there is no texture given.
-	if (!source) {
-#ifdef _DEBUG
-		assert(!source);
-#endif
-		return;
-	}
-	if (!target) {
-#ifdef _DEBUG
-		assert(!target);
-#endif
-		return;
-	}
-
-	// Ensure texture sizes match
-	if ((source->get_width() != target->get_width()) || (source->get_height() != target->get_height())) {
-		throw std::invalid_argument("source and target must have same size");
-	}
-
-	// Ensure texture types match
-	if ((source->get_type() != target->get_type())) {
-		throw std::invalid_argument("source and target must have same type");
-	}
-
-	// Ensure texture formats match
-	if ((source->get_color_format() != target->get_color_format())) {
-		throw std::invalid_argument("source and target must have same format");
-	}
-
+	// Enter Graphics Context
 	auto gctx = gs::context();
 
-	// Copy original texture
-	//gs_copy_texture(target->get_object(), source->get_object());
-
-	// Test if we actually need to recreate the render target for a different format or at all.
-	if ((!_rt) || (source->get_color_format() != _rt->get_color_format())) {
-		_rt = std::make_unique<gs::rendertarget>(source->get_color_format(), GS_ZS_NONE);
+	// Validate some things to make sure we can actually work.
+	if (!source || !target) { // Neither source or target exists, skip.
+		throw std::invalid_argument("Missing source or target, skipping.");
 	}
 
-	// Render
-	graphics_t* ctx = gs_get_context();
-#if defined(WIN32) || defined(WIN64)
-	gs_d3d11_device* dev = reinterpret_cast<gs_d3d11_device*>(ctx->device);
-#endif
-	int         device_type = gs_get_device_type();
-	void*       sobj        = gs_texture_get_obj(source->get_object());
-	void*       tobj        = gs_texture_get_obj(target->get_object());
-	std::string technique   = "Draw";
-
-	switch (generator) {
-	case generator::Point:
-		technique = "Point";
-		break;
-	case generator::Linear:
-		technique = "Linear";
-		break;
-	case generator::Sharpen:
-		technique = "Sharpen";
-		break;
-	case generator::Smoothen:
-		technique = "Smoothen";
-		break;
-	case generator::Bicubic:
-		technique = "Bicubic";
-		break;
-	case generator::Lanczos:
-		technique = "Lanczos";
-		break;
+	// Ensure Source and Target match.
+	if ((source->get_width() != target->get_width()) || (source->get_height() != target->get_height())
+		|| (source->get_type() != target->get_type()) || (source->get_color_format() != target->get_color_format())) {
+		throw std::invalid_argument("Source and Target textures must be the same size, type and format");
 	}
 
-	gs_load_vertexbuffer(_vb->update());
-	gs_load_indexbuffer(nullptr);
+	auto   gdbg       = gs::debug_marker(gs::debug_color_cache, "gs::mipmapper");
+	size_t mip_levels = 0;
 
-	if (source->get_type() == gs::texture::type::Normal) {
-		size_t  texture_width  = source->get_width();
-		size_t  texture_height = source->get_height();
-		float_t texel_width    = 1.0f / texture_width;
-		float_t texel_height   = 1.0f / texture_height;
-		size_t  mip_levels     = 1;
+#ifdef WIN32
+	if (gs_get_device_type() == GS_DEVICE_DIRECT3D_11) {
+		D3D11_TEXTURE2D_DESC src_desc;
+		D3D11_TEXTURE2D_DESC tgt_desc;
 
-#if defined(WIN32) || defined(WIN64)
-		ID3D11Texture2D* target_t2 = nullptr;
-		ID3D11Texture2D* source_t2 = nullptr;
-		if (device_type == GS_DEVICE_DIRECT3D_11) {
-			// We definitely have a Direct3D11 resource.
-			D3D11_TEXTURE2D_DESC target_t2desc;
-			target_t2 = reinterpret_cast<ID3D11Texture2D*>(tobj);
-			source_t2 = reinterpret_cast<ID3D11Texture2D*>(sobj);
-			target_t2->GetDesc(&target_t2desc);
-			dev->context->CopySubresourceRegion(target_t2, 0, 0, 0, 0, source_t2, 0, nullptr);
-			mip_levels = target_t2desc.MipLevels;
+		ATL::CComPtr<ID3D11Texture2D> source_texture =
+			reinterpret_cast<ID3D11Texture2D*>(gs_texture_get_obj(source->get_object()));
+		ATL::CComPtr<ID3D11Texture2D> target_texture =
+			reinterpret_cast<ID3D11Texture2D*>(gs_texture_get_obj(target->get_object()));
+
+		source_texture->GetDesc(&src_desc);
+		target_texture->GetDesc(&tgt_desc);
+
+		mip_levels = tgt_desc.MipLevels;
+
+		if ((!_d3d_rtt) || (!_d3d_rtv) || (_width != source->get_width()) || (_height != source->get_height())) {
+			auto gdbg = gs::debug_marker(gs::debug_color_cache, "Recreate RenderTarget");
+			// Recreate the Render Target due to the source changing size.
+			D3D11_TEXTURE2D_DESC rt_desc = {};
+			rt_desc.Width                = tgt_desc.Width;
+			rt_desc.Height               = tgt_desc.Height;
+			rt_desc.MipLevels            = 1;
+			rt_desc.ArraySize            = 1;
+			rt_desc.Format               = tgt_desc.Format;
+			rt_desc.SampleDesc.Count     = 1;
+			rt_desc.SampleDesc.Quality   = 0;
+			rt_desc.Usage                = D3D11_USAGE_DEFAULT;
+			rt_desc.BindFlags            = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+			rt_desc.CPUAccessFlags       = 0;
+			rt_desc.MiscFlags            = 0;
+			_d3d_device->CreateTexture2D(&rt_desc, nullptr, &_d3d_rtt);
+
+			D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+			rtv_desc.Format                        = tgt_desc.Format;
+			rtv_desc.ViewDimension                 = D3D11_RTV_DIMENSION_TEXTURE2D;
+			rtv_desc.Texture2D.MipSlice            = 0;
+
+			_d3d_device->CreateRenderTargetView(_d3d_rtt, &rtv_desc, &_d3d_rtv);
+
+			_width  = source->get_width();
+			_height = source->get_height();
 		}
-#endif
-		if (device_type == GS_DEVICE_OPENGL) {
-			// This is an OpenGL resource.
+		if (!_d3d_dss) {
+			D3D11_DEPTH_STENCIL_DESC dss_desc;
+			dss_desc.DepthEnable      = false;
+			dss_desc.DepthWriteMask   = D3D11_DEPTH_WRITE_MASK_ZERO;
+			dss_desc.DepthFunc        = D3D11_COMPARISON_ALWAYS;
+			dss_desc.StencilEnable    = false;
+			dss_desc.StencilReadMask  = 0;
+			dss_desc.StencilWriteMask = 0;
+			dss_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+			dss_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+			dss_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+			dss_desc.FrontFace.StencilFunc = D3D11_COMPARISON_NEVER;
+			dss_desc.BackFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+			dss_desc.BackFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+			dss_desc.BackFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+			dss_desc.BackFace.StencilFunc = D3D11_COMPARISON_NEVER;
+			_d3d_device->CreateDepthStencilState(&dss_desc, &_d3d_dss);
 		}
 
-		// If we do not have any miplevels, just stop now.
-		if (mip_levels == 1) {
-			return;
-		}
+		// Copy Mip 0.
+		_d3d_context->CopySubresourceRegion(target_texture, 0, 0, 0, 0, source_texture, 0, nullptr);
 
-		for (size_t mip = 1; mip < mip_levels; mip++) {
-			texture_width /= 2;
-			texture_height /= 2;
-			if (texture_width == 0) {
-				texture_width = 1;
-			}
-			if (texture_height == 0) {
-				texture_height = 1;
-			}
+		// Load Vertex and Index buffer.
+		auto prev_rt = gs_get_render_target();
+		auto prev_zs = gs_get_zstencil_target();
+		gs_viewport_push();
+		gs_projection_push();
+		gs_matrix_push();
 
-			texel_width  = 1.0f / texture_width;
-			texel_height = 1.0f / texture_height;
+		// Render each layer using the previous layer.
+		uint32_t width  = source->get_width();
+		uint32_t height = source->get_height();
+		for (size_t lvl = 1; lvl < mip_levels; lvl++) {
+			auto gdbg2 = gs::debug_marker(gs::debug_color_convert, "Layer %llu", lvl);
+			width      = std::max(1ul, width / 2ul);
+			height     = std::max(1ul, height / 2ul);
 
-			// Draw mipmap layer
-			try {
-				auto op = _rt->render(uint32_t(texture_width), uint32_t(texture_height));
+			{
+				// Set Render Target
+				ID3D11RenderTargetView* view = _d3d_rtv.p;
+				_d3d_context->OMSetRenderTargets(1, &view, nullptr);
 
-				gs_set_cull_mode(GS_NEITHER);
-				gs_reset_blend_state();
-				gs_blend_function_separate(gs_blend_type::GS_BLEND_ONE, gs_blend_type::GS_BLEND_ZERO,
-										   gs_blend_type::GS_BLEND_ONE, gs_blend_type::GS_BLEND_ZERO);
-				gs_enable_depth_test(false);
-				gs_enable_stencil_test(false);
-				gs_enable_stencil_write(false);
-				gs_enable_color(true, true, true, true);
+				const FLOAT col[] = {rand() / 65535.0, rand() / 65535.0, rand() / 65535.0, 1.};
+				_d3d_context->ClearRenderTargetView(view, col);
+
+				// Set State
+				FLOAT blend[] = {1., 1., 1., 1.};
+				_d3d_context->OMSetBlendState(NULL, blend, 0xffffffff);
+				_d3d_context->OMSetDepthStencilState(NULL, 0);
+				_d3d_context->OMSetDepthStencilState(_d3d_dss.p, 0);
+
+				// Set Viewport
+				D3D11_VIEWPORT vp = {};
+				vp.TopLeftX = 0.;
+				vp.TopLeftY = 0.;
+				vp.Width = width;
+				vp.Height = height;
+				vp.MinDepth = 0.;
+				vp.MaxDepth = 1.;
+				_d3d_context->RSSetViewports(1, &vp);
+
+				// 
+
+				gs_load_vertexbuffer(_vb->update());
+				gs_load_indexbuffer(nullptr);
+
 				gs_ortho(0, 1, 0, 1, -1, 1);
 
-				vec4 black;
-				vec4_zero(&black);
-				gs_clear(GS_CLEAR_COLOR | GS_CLEAR_DEPTH, &black, 0, 0);
-
+				_effect->get_parameter("image_size")
+					->set_float2(static_cast<float_t>(width), static_cast<float_t>(height));
+				_effect->get_parameter("image_texel")->set_float2(1.0f / width, 1.0f / height);
+				_effect->get_parameter("image_level")->set_int(int32_t(lvl - 1));
 				_effect->get_parameter("image")->set_texture(target);
-				_effect->get_parameter("level")->set_int(int32_t(mip - 1));
-				_effect->get_parameter("imageTexel")->set_float2(texel_width, texel_height);
-				_effect->get_parameter("strength")->set_float(strength);
 
-				while (gs_effect_loop(_effect->get_object(), technique.c_str())) {
+				while (gs_effect_loop(_effect->get_object(), "Draw")) {
 					gs_draw(gs_draw_mode::GS_TRIS, 0, _vb->size());
 				}
-			} catch (...) {
-				P_LOG_ERROR("Failed to render mipmap layer.");
+
+				// Clear Render Target
+				_d3d_context->OMSetRenderTargets(0, nullptr, nullptr);
 			}
 
-#if defined(WIN32) || defined(WIN64)
-			if (device_type == GS_DEVICE_DIRECT3D_11) {
-				// Copy
-				ID3D11Texture2D* rt    = reinterpret_cast<ID3D11Texture2D*>(gs_texture_get_obj(_rt->get_object()));
-				uint32_t         level = uint32_t(D3D11CalcSubresource(UINT(mip), 0, UINT(mip_levels)));
-				dev->context->CopySubresourceRegion(target_t2, level, 0, 0, 0, rt, 0, NULL);
+			{ // Copy subregion
+				auto      gdbg2 = gs::debug_marker(gs::debug_color_cache_render, "Copy");
+				D3D11_BOX box;
+				box.left   = 0;
+				box.right  = width;
+				box.top    = 0;
+				box.bottom = height;
+				box.front  = 0;
+				box.back   = 1;
+
+				_d3d_context->CopySubresourceRegion(target_texture, UINT(lvl), 0, 0, 0, _d3d_rtt, 0, &box);
 			}
-#endif
+
+			_d3d_context->Flush();
 		}
-	}
 
-	gs_load_indexbuffer(nullptr);
-	gs_load_vertexbuffer(nullptr);
+		gs_matrix_pop();
+		gs_projection_pop();
+		gs_viewport_pop();
+		gs_load_indexbuffer(nullptr);
+		gs_load_vertexbuffer(nullptr);
+		gs_set_render_target(prev_rt, prev_zs);
+	}
+#endif
+	if (gs_get_device_type() == GS_DEVICE_OPENGL) {
+		// Not Implemented Yet.
+	}
 }

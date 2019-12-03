@@ -33,11 +33,42 @@
 #pragma warning(pop)
 #endif
 
+#ifdef WIN32
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4191)
+#pragma warning(disable : 4201)
+#pragma warning(disable : 4365)
+#pragma warning(disable : 4777)
+#pragma warning(disable : 4986)
+#pragma warning(disable : 5039)
+#endif
+#include <atlutil.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <windows.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+#endif
+
 namespace gs {
 	class mipmapper {
-		std::unique_ptr<gs::vertex_buffer> _vb;
-		std::unique_ptr<gs::rendertarget>  _rt;
-		std::unique_ptr<gs::effect>        _effect;
+#ifdef WIN32
+		// Direct3D 11
+		ATL::CComPtr<ID3D11Device>            _d3d_device;
+		ATL::CComPtr<ID3D11DeviceContext>     _d3d_context;
+		ATL::CComPtr<ID3D11Texture2D>         _d3d_rtt;
+		ATL::CComPtr<ID3D11RenderTargetView>  _d3d_rtv;
+		ATL::CComPtr<ID3D11DepthStencilState> _d3d_dss;
+#endif
+
+		std::shared_ptr<gs::vertex_buffer> _vb;
+		std::shared_ptr<gs::rendertarget>  _rt;
+		std::shared_ptr<gs::effect>        _effect;
+
+		uint32_t _width;
+		uint32_t _height;
 
 		public:
 		enum class generator : uint8_t {
